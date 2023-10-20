@@ -1,0 +1,96 @@
+= Camel LRU Cache issue
+
+This project demonstrates that the LRU cache used by an OGNL expression in the simple language does not use link:https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/lang/ref/SoftReference.html[soft references (`docs.oracle.com`)].
+
+We define a timer-triggered route that will set the body of the exchange to a large message. Then, we will access a field of that large object through OGNL:
+
+.Timer Route
+[source,java]
+----
+public class Timer {
+  ...
+  static RouteBuilder timerRoute() {
+    return new RouteBuilder() {
+      private final AtomicInteger calls = new AtomicInteger();
+
+      @Override
+      public void configure() {
+        // @formatter:off
+        from(
+            timer("timer")
+                .period(Duration.ofMillis(100).toMillis())
+                .fixedRate(true))
+            .process(exchange -> {
+              log.info("calls: {}", calls.incrementAndGet());
+              exchange.getIn().setBody(new LargeObject());
+            })
+            .log("${body.fieldTwo}");
+        // @formatter:on
+      }
+    };
+  }
+}
+----
+
+The large object is just a simple, immutable POJO:
+
+.Large Object
+[source,java]
+----
+@Value
+public class LargeObject {
+  private static final Random RANDOM = new Random();
+
+  byte[] data;
+  String fieldOne;
+  String fieldTwo;
+
+  public LargeObject() {
+    this.data = new byte[100 * 1024 * 1024]; // 100 MB
+    RANDOM.nextBytes(data);
+    fieldOne = UUID.randomUUID().toString();
+    fieldTwo = UUID.randomUUID().toString();
+  }
+}
+----
+
+Notice that we do not hold a reference to the large object, we only print one of its fields through the OGNL expression in the simple expression.
+
+== Building the program
+.Building the program
+[source,bash]
+----
+./mvnw clean package
+----
+
+== Running the program, observing the error
+For the test to end in a sensible amount of time, we need to limit the max heap of the VM. We will do so by setting JVM parameters `-XX:MinRAMPercentage` and `-XX:MaxRAMPercentage` to a sufficient low value. For my system (32 GB RAM), 10(%) has the desired effect. We also stop the program on the first `OutOfMemoryError` through `-XX:+ExitOnOutOfMemoryError`.
+
+.Starting the program
+[source,bash]
+----
+java \
+  -XX:MinRAMPercentage=10 \
+  -XX:MaxRAMPercentage=10 \
+  -XX:+ExitOnOutOfMemoryError \
+  -jar target/camel-lru-cache-1.0-SNAPSHOT-executable-jar.jar
+----
+
+The execution results in the following logs:
+
+.Execution log
+[source]
+----
+...
+[l-1) thread #1 - timer://timer] Timer$1                        INFO  calls: 28
+[l-1) thread #1 - timer://timer] route1                         INFO  d5b46d51-abe6-49c8-bd93-badf9fa76a29
+[l-1) thread #1 - timer://timer] Timer$1                        INFO  calls: 29
+[l-1) thread #1 - timer://timer] route1                         INFO  c189554a-191b-49ea-b493-97f44a974aa7
+[l-1) thread #1 - timer://timer] Timer$1                        INFO  calls: 30
+[l-1) thread #1 - timer://timer] route1                         INFO  15860384-501a-4a6a-a061-1ff8f14f8b03
+[l-1) thread #1 - timer://timer] Timer$1                        INFO  calls: 31
+[l-1) thread #1 - timer://timer] route1                         INFO  0fe28994-795e-4e5b-a733-38350a332da3
+[l-1) thread #1 - timer://timer] Timer$1                        INFO  calls: 32
+Terminating due to java.lang.OutOfMemoryError: Java heap space
+
+----
